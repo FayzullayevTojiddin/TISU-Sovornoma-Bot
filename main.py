@@ -14,7 +14,7 @@ async def main():
 
     bot = Bot(token=Config.BOT_TOKEN)
     dp = Dispatcher()
-    dp.message.middleware(SubscriptionMiddleware())
+    dp.update.middleware(SubscriptionMiddleware())
     dp.include_router(router)
 
     app = web.Application()
