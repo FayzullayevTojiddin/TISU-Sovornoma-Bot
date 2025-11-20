@@ -1,3 +1,5 @@
+import time
+import asyncio
 from aiogram import BaseMiddleware
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.exceptions import TelegramBadRequest
@@ -5,6 +7,12 @@ from models import User
 from config import Config
 
 class SubscriptionMiddleware(BaseMiddleware):
+    def __init__(self):
+        super().__init__()
+        self._last_ts = {}
+        self._lock = asyncio.Lock()
+        self._interval = 1.0
+
     async def __call__(self, handler, event, data):
         user_obj = getattr(event, "from_user", None)
         bot = data.get("bot") or getattr(event, "bot", None)
@@ -12,6 +20,19 @@ class SubscriptionMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         tg_id = user_obj.id
+
+        now = time.monotonic()
+        async with self._lock:
+            last = self._last_ts.get(tg_id)
+            if last is not None and (now - last) < self._interval:
+                return
+            self._last_ts[tg_id] = now
+            if len(self._last_ts) > 10000:
+                cutoff = now - 60
+                to_del = [u for u, t in self._last_ts.items() if t < cutoff]
+                for u in to_del:
+                    del self._last_ts[u]
+
         defaults = {
             "first_name": getattr(user_obj, "first_name", None),
             "last_name": getattr(user_obj, "last_name", None),
@@ -38,7 +59,7 @@ class SubscriptionMiddleware(BaseMiddleware):
         chan_username = getattr(Config, "CHANNEL_USERNAME", None)
         if chan_username:
             kb_buttons.append(
-                InlineKeyboardButton(text="Kanalga o‘tish", url=f"t.me/{chan_username}")
+                InlineKeyboardButton(text="Kanalga o‘tish", url=f"https://t.me/{chan_username}")
             )
         kb_buttons.append(InlineKeyboardButton(text="Obunani tekshirish", callback_data="check_sub"))
 
@@ -58,4 +79,4 @@ class SubscriptionMiddleware(BaseMiddleware):
         except Exception:
             pass
 
-        return
+        return await handler(event, data)
