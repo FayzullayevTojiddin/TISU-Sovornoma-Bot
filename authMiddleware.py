@@ -36,32 +36,35 @@ class SubscriptionMiddleware(BaseMiddleware):
 
     def _extract_user_and_type(self, event):
         """
-        Try to extract user_id and event type robustly.
-        Returns (user_id, kind, extra) where kind is "message"/"callback"/"other"
-        and extra is message_id when applicable.
+        Returns tuple (user_id, kind, message_id, callback_obj)
+        kind: "message" / "callback" / "other"
+        callback_obj: actual CallbackQuery object if available, else None
         """
-        # CallbackQuery
+        # Direct CallbackQuery object
         if isinstance(event, CallbackQuery):
             user = getattr(event.from_user, "id", None)
-            return user, "callback", None
-        # Message
+            return user, "callback", None, event
+
+        # Direct Message object
         if isinstance(event, Message):
             user = getattr(event.from_user, "id", None)
-            return user, "message", getattr(event, "message_id", None)
-        # Sometimes event is raw Update with attributes:
+            return user, "message", getattr(event, "message_id", None), None
+
+        # Raw Update-like object with attributes
         if hasattr(event, "callback_query") and event.callback_query:
             user = getattr(event.callback_query.from_user, "id", None)
-            return user, "callback", None
+            return user, "callback", None, event.callback_query
         if hasattr(event, "message") and event.message:
             user = getattr(event.message.from_user, "id", None)
-            return user, "message", getattr(event.message, "message_id", None)
+            return user, "message", getattr(event.message, "message_id", None), None
+
         # fallback
         user = getattr(getattr(event, "from_user", None), "id", None)
-        return user, "other", None
+        return user, "other", None, None
 
     async def __call__(self, handler, event, data):
         bot = data.get("bot") or getattr(event, "bot", None)
-        user_id, kind, msg_id = self._extract_user_and_type(event)
+        user_id, kind, msg_id, cq = self._extract_user_and_type(event)
 
         if not user_id:
             # no user -> just continue
@@ -73,18 +76,51 @@ class SubscriptionMiddleware(BaseMiddleware):
             last = self._last_ts.get(user_id)
             if last is not None and (now - last) < self._interval:
                 LOG.debug("Rate limit hit for user %s (kind=%s). last=%s now=%s", user_id, kind, last, now)
-                # show alert for callbacks
+                # notify user: prefer CallbackQuery.answer() if available
                 try:
-                    if kind == "callback" and isinstance(event, CallbackQuery):
-                        try:
-                            await bot.answer_callback_query(
-                                callback_query_id=event.id,
-                                text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
-                                show_alert=True
-                            )
-                        except Exception as e:
-                            LOG.debug("answer_callback_query failed: %s", e)
-                            await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.")
+                    if kind == "callback":
+                        # prefer direct cq.answer()
+                        if cq is not None:
+                            try:
+                                await cq.answer(
+                                    text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
+                                    show_alert=True
+                                )
+                                LOG.debug("Answered callback_query via cq.answer for user %s", user_id)
+                            except Exception as e:
+                                LOG.debug("cq.answer failed: %s", e)
+                                # fallback to bot.answer_callback_query using id if available
+                                try:
+                                    callback_id = getattr(cq, "id", None)
+                                    if callback_id:
+                                        await bot.answer_callback_query(
+                                            callback_query_id=callback_id,
+                                            text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
+                                            show_alert=True
+                                        )
+                                        LOG.debug("Answered callback_query via bot.answer_callback_query (fallback) for user %s", user_id)
+                                    else:
+                                        # final fallback: ephemeral message
+                                        await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
+                                except Exception as e2:
+                                    LOG.debug("bot.answer_callback_query fallback failed: %s", e2)
+                                    await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
+                        else:
+                            # no cq object available — try best-effort using bot
+                            try:
+                                callback_id = getattr(event, "id", None) or getattr(event, "callback_query", None) and getattr(event.callback_query, "id", None)
+                                if callback_id:
+                                    await bot.answer_callback_query(
+                                        callback_query_id=callback_id,
+                                        text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
+                                        show_alert=True
+                                    )
+                                    LOG.debug("Answered callback_query via bot.answer_callback_query (event fallback) for user %s", user_id)
+                                else:
+                                    await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
+                            except Exception as e:
+                                LOG.debug("Fallback bot.answer_callback_query failed: %s", e)
+                                await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
                     elif kind == "message":
                         await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.", reply_to=msg_id)
                     else:
