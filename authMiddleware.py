@@ -28,7 +28,7 @@ class SubscriptionMiddleware(BaseMiddleware):
 
         # config
         self._window_secs = 20.0         # sliding window length
-        self._limit_count = 20           # if >= this many in window -> block
+        self._limit_count = 10           # if >= this many in window -> block
         self._block_secs = 60.0          # block duration when exceeded
         self._sub_prompt_cooldown = 30.0 # don't re-send sub prompt more often than this
         self._auto_delete_secs = 3.0     # ephemeral text messages auto-delete
