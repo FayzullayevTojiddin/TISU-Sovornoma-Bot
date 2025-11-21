@@ -1,23 +1,39 @@
 import time
 import asyncio
 import logging
+from collections import deque
+from typing import Optional
+
 from aiogram import BaseMiddleware
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, Message
 from aiogram.exceptions import TelegramBadRequest
+
 from models import User
 from config import Config
 
 LOG = logging.getLogger(__name__)
 
+
 class SubscriptionMiddleware(BaseMiddleware):
     def __init__(self):
         super().__init__()
-        self._last_ts = {}            # user_id -> last handled monotonic time
-        self._lock = asyncio.Lock()
-        self._interval = 1.0         # seconds
-        self._auto_delete_secs = 3.0
+        # user_id -> deque of monotonic timestamps (requests within sliding window)
+        self._req_times: dict[int, deque] = {}
+        # user_id -> blocked_until monotonic time (float) if blocked, else absent
+        self._blocked_until: dict[int, float] = {}
+        # avoid spamming the "please subscribe" prompt: user_id -> last prompt monotonic time
+        self._last_sub_prompt: dict[int, float] = {}
 
-    async def _send_message_and_delete(self, bot, chat_id: int, text: str, reply_to: int | None = None):
+        self._lock = asyncio.Lock()
+
+        # config
+        self._window_secs = 20.0         # sliding window length
+        self._limit_count = 20           # if >= this many in window -> block
+        self._block_secs = 60.0          # block duration when exceeded
+        self._sub_prompt_cooldown = 30.0 # don't re-send sub prompt more often than this
+        self._auto_delete_secs = 3.0     # ephemeral text messages auto-delete
+
+    async def _send_message_and_delete(self, bot, chat_id: int, text: str, reply_to: Optional[int] = None):
         try:
             if reply_to:
                 sent = await bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to)
@@ -26,12 +42,14 @@ class SubscriptionMiddleware(BaseMiddleware):
         except Exception as e:
             LOG.debug("Failed to send rate-limit message: %s", e)
             return
+
         async def _del_later(msg):
             await asyncio.sleep(self._auto_delete_secs)
             try:
                 await bot.delete_message(chat_id=msg.chat.id, message_id=msg.message_id)
             except Exception:
                 pass
+
         asyncio.create_task(_del_later(sent))
 
     def _extract_user_and_type(self, event):
@@ -40,17 +58,14 @@ class SubscriptionMiddleware(BaseMiddleware):
         kind: "message" / "callback" / "other"
         callback_obj: actual CallbackQuery object if available, else None
         """
-        # Direct CallbackQuery object
         if isinstance(event, CallbackQuery):
             user = getattr(event.from_user, "id", None)
             return user, "callback", None, event
 
-        # Direct Message object
         if isinstance(event, Message):
             user = getattr(event.from_user, "id", None)
             return user, "message", getattr(event, "message_id", None), None
 
-        # Raw Update-like object with attributes
         if hasattr(event, "callback_query") and event.callback_query:
             user = getattr(event.callback_query.from_user, "id", None)
             return user, "callback", None, event.callback_query
@@ -58,7 +73,6 @@ class SubscriptionMiddleware(BaseMiddleware):
             user = getattr(event.message.from_user, "id", None)
             return user, "message", getattr(event.message, "message_id", None), None
 
-        # fallback
         user = getattr(getattr(event, "from_user", None), "id", None)
         return user, "other", None, None
 
@@ -70,75 +84,85 @@ class SubscriptionMiddleware(BaseMiddleware):
             # no user -> just continue
             return await handler(event, data)
 
-        # RATE LIMIT
         now = time.monotonic()
+
+        # --- Rate limiting & blocking logic (atomic) ---
         async with self._lock:
-            last = self._last_ts.get(user_id)
-            if last is not None and (now - last) < self._interval:
-                LOG.debug("Rate limit hit for user %s (kind=%s). last=%s now=%s", user_id, kind, last, now)
-                # notify user: prefer CallbackQuery.answer() if available
+            # check if currently blocked
+            blocked_until = self._blocked_until.get(user_id)
+            if blocked_until and now < blocked_until:
+                LOG.debug("User %s is currently blocked until %s (now=%s)", user_id, blocked_until, now)
+                # notify user about block (do not call handler)
                 try:
+                    remaining = int(blocked_until - now)
+                    msg = f"Siz juda koʻp soʻrov yubordingiz. {remaining} soniyaga bloklandi. Iltimos, keyinroq urinib koʻring."
+                    # prefer callback answer
                     if kind == "callback":
-                        # prefer direct cq.answer()
-                        if cq is not None:
-                            try:
-                                await cq.answer(
-                                    text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
-                                    show_alert=True
-                                )
-                                LOG.debug("Answered callback_query via cq.answer for user %s", user_id)
-                            except Exception as e:
-                                LOG.debug("cq.answer failed: %s", e)
-                                # fallback to bot.answer_callback_query using id if available
-                                try:
-                                    callback_id = getattr(cq, "id", None)
-                                    if callback_id:
-                                        await bot.answer_callback_query(
-                                            callback_query_id=callback_id,
-                                            text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
-                                            show_alert=True
-                                        )
-                                        LOG.debug("Answered callback_query via bot.answer_callback_query (fallback) for user %s", user_id)
-                                    else:
-                                        # final fallback: ephemeral message
-                                        await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
-                                except Exception as e2:
-                                    LOG.debug("bot.answer_callback_query fallback failed: %s", e2)
-                                    await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
-                        else:
-                            # no cq object available — try best-effort using bot
-                            try:
-                                callback_id = getattr(event, "id", None) or getattr(event, "callback_query", None) and getattr(event.callback_query, "id", None)
-                                if callback_id:
-                                    await bot.answer_callback_query(
-                                        callback_query_id=callback_id,
-                                        text="Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.",
-                                        show_alert=True
-                                    )
-                                    LOG.debug("Answered callback_query via bot.answer_callback_query (event fallback) for user %s", user_id)
-                                else:
-                                    await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
-                            except Exception as e:
-                                LOG.debug("Fallback bot.answer_callback_query failed: %s", e)
-                                await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
-                    elif kind == "message":
-                        await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi. Keyinroq urinib ko‘ring.", reply_to=msg_id)
+                        try:
+                            if cq is not None:
+                                await cq.answer(text=msg, show_alert=True)
+                                return
+                            else:
+                                cbid = getattr(event, "id", None) or getattr(getattr(event, "callback_query", None), "id", None)
+                                if cbid:
+                                    await bot.answer_callback_query(callback_query_id=cbid, text=msg, show_alert=True)
+                                    return
+                        except Exception as e:
+                            LOG.debug("callback answer failed while blocked: %s", e)
+                            await self._send_message_and_delete(bot, user_id, msg)
+                            return
                     else:
-                        await self._send_message_and_delete(bot, user_id, "Iltimos — 1 soniyada faqat bitta amal bajariladi.")
+                        await self._send_message_and_delete(bot, user_id, msg, reply_to=msg_id)
+                        return
                 except Exception as e:
-                    LOG.debug("Failed to notify user about rate limit: %s", e)
+                    LOG.debug("Failed to notify blocked user %s: %s", user_id, e)
+                    return
 
-                return  # DO NOT call handler
+            # not currently blocked -> update request timestamps
+            dq = self._req_times.get(user_id)
+            if dq is None:
+                dq = deque()
+                self._req_times[user_id] = dq
 
-            # accept and record
-            self._last_ts[user_id] = now
-            if len(self._last_ts) > 10000:
-                cutoff = now - 60
-                to_del = [u for u, t in self._last_ts.items() if t < cutoff]
-                for u in to_del:
-                    del self._last_ts[u]
+            # push current timestamp and pop older than window
+            dq.append(now)
+            cutoff = now - self._window_secs
+            while dq and dq[0] < cutoff:
+                dq.popleft()
 
-        # continue original logic (User.get_or_create + subscription check)
+            # if limit reached -> block
+            if len(dq) >= self._limit_count:
+                self._blocked_until[user_id] = now + self._block_secs
+                # clear request history to avoid repeated triggers
+                dq.clear()
+                LOG.info("User %s exceeded %d requests in %ds: blocking for %ds", user_id, self._limit_count, int(self._window_secs), int(self._block_secs))
+                # inform user about the block
+                try:
+                    block_msg = f"Siz {int(self._window_secs)} soniyada {self._limit_count} yoki undan koʻp soʻrov yubordingiz. {int(self._block_secs)} soniyaga bloklanildi."
+                    if kind == "callback":
+                        try:
+                            if cq is not None:
+                                await cq.answer(text=block_msg, show_alert=True)
+                                return
+                            else:
+                                cbid = getattr(event, "id", None) or getattr(getattr(event, "callback_query", None), "id", None)
+                                if cbid:
+                                    await bot.answer_callback_query(callback_query_id=cbid, text=block_msg, show_alert=True)
+                                    return
+                        except Exception as e:
+                            LOG.debug("callback block answer failed: %s", e)
+                            await self._send_message_and_delete(bot, user_id, block_msg)
+                            return
+                    else:
+                        await self._send_message_and_delete(bot, user_id, block_msg, reply_to=msg_id)
+                        return
+                except Exception as e:
+                    LOG.debug("Failed to notify user about new block: %s", e)
+                    return
+
+        # --- End rate-limit/block section ---
+
+        # Record (or create) user in DB (non-critical; ignore failures)
         user_obj = getattr(event, "from_user", None) or getattr(getattr(event, "message", None), "from_user", None) or getattr(getattr(event, "callback_query", None), "from_user", None)
         defaults = {
             "first_name": getattr(user_obj, "first_name", None),
@@ -150,19 +174,32 @@ class SubscriptionMiddleware(BaseMiddleware):
         except Exception:
             pass
 
+        # If no bot or no channel configured, continue
         if not bot or not getattr(Config, "CHANNEL_ID", None):
             return await handler(event, data)
 
+        # Check subscription. If not subscribed, send subscription prompt and DO NOT call handler.
         try:
             member = await bot.get_chat_member(chat_id=Config.CHANNEL_ID, user_id=user_id)
             if member.status in ("creator", "administrator", "member", "restricted"):
+                # subscribed -> continue to handler
                 return await handler(event, data)
         except TelegramBadRequest:
+            # user is not a member or Telegram returned 400-series error -> treat as not subscribed
             pass
-        except Exception:
+        except Exception as e:
+            LOG.debug("Error while checking chat member for user %s: %s", user_id, e)
+            # to be safe, allow handler to proceed on unexpected errors
             return await handler(event, data)
 
-        # send subscription message
+        # At this point: user is not subscribed -> send subscription prompt (but respect cooldown)
+        last_prompt = self._last_sub_prompt.get(user_id, 0.0)
+        if now - last_prompt < self._sub_prompt_cooldown:
+            # recently prompted -> do not spam user again, and do not call handler
+            LOG.debug("Skipping repeated sub prompt for user %s (cooldown)", user_id)
+            return  # do not call handler
+
+        # build keyboard and send message
         kb_buttons = []
         chan_username = getattr(Config, "CHANNEL_USERNAME", None)
         if chan_username:
@@ -181,7 +218,11 @@ class SubscriptionMiddleware(BaseMiddleware):
                 parse_mode="HTML",
                 reply_markup=markup
             )
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.debug("Failed to send subscription prompt to user %s: %s", user_id, e)
 
-        return await handler(event, data)
+        # remember we prompted the user (to avoid spamming)
+        self._last_sub_prompt[user_id] = now
+
+        # important: DO NOT call handler when user is not subscribed
+        return
